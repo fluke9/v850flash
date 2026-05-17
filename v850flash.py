@@ -700,6 +700,59 @@ def _diffprogram_once(p: "Programmer", region: str, entry: dict,
     return len(todo)
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Read the region from the chip and compare to a file. Exit 0 on full
+    match, 1 on mismatch. Lists the first few differing blocks for context."""
+    with open(args.input, "rb") as fp:
+        data = fp.read()
+    p = _open_device(args)
+    try:
+        name, entry = _resolve_chip(p)
+        if args.region not in entry:
+            print(f"device '{name}' has no {args.region} region", file=sys.stderr)
+            return 2
+        data = _validate_file(args.region, entry, data)
+        if data is None:
+            return 2
+        if args.fast:
+            actual = p.go_fast(target_baud=args.baud, osc_params=(osc_bytes_from_mhz(args.osc) if args.osc else None))
+            sys.stderr.write(f"switched chip to {actual} baud\n")
+        start, end = entry[args.region]
+        bpa = 2 if args.region == "dflash" else 1
+        expected = (end - start + 1) * bpa
+        last = [0.0]
+        def show(done: int, total: int) -> None:
+            now = time.time()
+            if now - last[0] > 0.2 or done == total:
+                pct = 100 * done / total if total else 0
+                sys.stderr.write(f"\r  reading {args.region}: {done}/{total} ({pct:5.1f}%)")
+                sys.stderr.flush()
+                last[0] = now
+        t0 = time.time()
+        cur = p.read_memory(start, end, progress=show, expected_size=expected)
+        sys.stderr.write("\n")
+        file_crc = binascii.crc32(data) & 0xFFFFFFFF
+        chip_crc = binascii.crc32(cur) & 0xFFFFFFFF
+        print(f"  file: {len(data)} B  crc32={file_crc:08x}")
+        print(f"  chip: {len(cur)} B  crc32={chip_crc:08x}  ({time.time()-t0:.1f} s)")
+        if cur == data:
+            print(f"OK: {args.region} matches {args.input}")
+            return 0
+        diff = _diff_blocks(args.region, entry, data, cur)
+        blk_addrs = entry["block_size"]
+        total = (end - start + 1) // blk_addrs
+        print(f"MISMATCH: {len(diff)}/{total} block(s) differ", file=sys.stderr)
+        show_n = 10
+        for i in diff[:show_n]:
+            addr = start + i * blk_addrs
+            print(f"  block {i}  @0x{addr:08X}", file=sys.stderr)
+        if len(diff) > show_n:
+            print(f"  ... and {len(diff) - show_n} more", file=sys.stderr)
+        return 1
+    finally:
+        p.close()
+
+
 def cmd_diffprogram(args: argparse.Namespace) -> int:
     """Read the chip, diff against the file, erase+program only the blocks
     that differ. Same arguments as `program`."""
@@ -1159,6 +1212,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="data-frame chunk size (default 256, max per spec)")
     _add_speed_opts(p_prog)
     p_prog.set_defaults(func=cmd_program)
+
+    p_ver = sub.add_parser("verify",
+                           help="read region from chip and compare to a file")
+    _add_port_opts(p_ver)
+    p_ver.add_argument("region", choices=["pflash", "dflash"])
+    p_ver.add_argument("input", help="file to compare against (same size as `program`)")
+    _add_speed_opts(p_ver)
+    p_ver.set_defaults(func=cmd_verify)
 
     p_diff = sub.add_parser("diffprogram",
                             help="read chip, diff vs file, program only changed blocks")

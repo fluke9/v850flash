@@ -13,6 +13,7 @@ serial adapter and a single resistor.
 | `dump` | read pflash / dflash / both to a file |
 | `erase` | erase pflash / dflash / both (block-granular) |
 | `program` | write a file into a region (region must be erased first) |
+| `verify` | read region from chip and compare it to a file |
 | `diffprogram` | read chip, diff against file, only program changed blocks |
 | `watchprogram` | edit-build-flash loop: watches a file, re-diff-programs on change |
 | `read` | dump an arbitrary address range |
