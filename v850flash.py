@@ -625,30 +625,42 @@ def cmd_dump(args: argparse.Namespace) -> int:
     return 0
 
 
-def _validate_file(region: str, entry: dict, data: bytes) -> bytes | None:
+def _validate_file(region: str, entry: dict, data: bytes,
+                   *, allow_short: bool = False) -> bytes | None:
     """Check that `data` has the right size for the chip region. Returns the
-    (possibly truncated) data, or None on error (after printing to stderr)."""
+    data (truncated if too long, 0xFF-padded to the next block boundary if
+    too short and `allow_short`), or None on error."""
     start, end = entry[region]
     bpa = 2 if region == "dflash" else 1
+    blk_bytes = entry["block_size"] * bpa
     expected = (end - start + 1) * bpa
-    if len(data) < expected:
-        print(f"file is {len(data)} B but {region} needs {expected} B",
-              file=sys.stderr)
-        return None
     if len(data) > expected:
         print(f"note: file is {len(data)} B, truncating to {expected} B "
               f"({region} region size)", file=sys.stderr)
-        data = data[:expected]
-    return data
+        return data[:expected]
+    if len(data) == expected:
+        return data
+    # short file
+    if not allow_short:
+        print(f"file is {len(data)} B but {region} needs {expected} B "
+              f"(pass --short to write only the covered blocks)",
+              file=sys.stderr)
+        return None
+    n_blocks = (len(data) + blk_bytes - 1) // blk_bytes
+    padded = data + b"\xff" * (n_blocks * blk_bytes - len(data))
+    total_blocks = expected // blk_bytes
+    print(f"note: short file ({len(data)} B), padding to {len(padded)} B "
+          f"= {n_blocks}/{total_blocks} block(s); rest of {region} is "
+          f"left untouched", file=sys.stderr)
+    return padded
 
 
 def _diff_blocks(region: str, entry: dict, want: bytes, cur: bytes) -> list[int]:
-    """Return indices of blocks where chip's content differs from `want`."""
-    start, end = entry[region]
+    """Return indices of blocks where chip's content differs from `want`.
+    Iterates min(len(want), len(cur)) so short files only diff their prefix."""
     bpa = 2 if region == "dflash" else 1
-    blk_addrs = entry["block_size"]
-    blk_bytes = blk_addrs * bpa
-    n_blocks = (end - start + 1) // blk_addrs
+    blk_bytes = entry["block_size"] * bpa
+    n_blocks = min(len(want), len(cur)) // blk_bytes
     return [i for i in range(n_blocks)
             if want[i*blk_bytes:(i+1)*blk_bytes] != cur[i*blk_bytes:(i+1)*blk_bytes]]
 
@@ -681,16 +693,18 @@ def _program_blocks(p: "Programmer", region: str, entry: dict,
 def _diffprogram_once(p: "Programmer", region: str, entry: dict,
                       want: bytes) -> int:
     """Read chip, compute diff, erase+program differing blocks. Returns
-    number of blocks programmed."""
+    number of blocks programmed. If `want` is shorter than the region we
+    only read & diff the prefix it covers."""
     start, end = entry[region]
     bpa = 2 if region == "dflash" else 1
-    n_addrs = end - start + 1
     blk_addrs = entry["block_size"]
-    total = n_addrs // blk_addrs
+    want_addrs = len(want) // bpa
+    read_end = min(end, start + want_addrs - 1)
+    total = want_addrs // blk_addrs
     print(f"  reading {region} for diff...")
     t0 = time.time()
-    cur = p.read_memory(start, end)
-    print(f"  read {n_addrs * bpa} B in {time.time()-t0:.1f} s")
+    cur = p.read_memory(start, read_end)
+    print(f"  read {len(cur)} B in {time.time()-t0:.1f} s")
     todo = _diff_blocks(region, entry, want, cur)
     print(f"  {len(todo)}/{total} blocks differ")
     if todo:
@@ -711,7 +725,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         if args.region not in entry:
             print(f"device '{name}' has no {args.region} region", file=sys.stderr)
             return 2
-        data = _validate_file(args.region, entry, data)
+        data = _validate_file(args.region, entry, data, allow_short=args.short)
         if data is None:
             return 2
         if args.fast:
@@ -719,7 +733,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
             sys.stderr.write(f"switched chip to {actual} baud\n")
         start, end = entry[args.region]
         bpa = 2 if args.region == "dflash" else 1
-        expected = (end - start + 1) * bpa
+        want_addrs = len(data) // bpa
+        read_end = min(end, start + want_addrs - 1)
+        expected = len(data)
         last = [0.0]
         def show(done: int, total: int) -> None:
             now = time.time()
@@ -729,18 +745,20 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 sys.stderr.flush()
                 last[0] = now
         t0 = time.time()
-        cur = p.read_memory(start, end, progress=show, expected_size=expected)
+        cur = p.read_memory(start, read_end, progress=show, expected_size=expected)
         sys.stderr.write("\n")
         file_crc = binascii.crc32(data) & 0xFFFFFFFF
         chip_crc = binascii.crc32(cur) & 0xFFFFFFFF
         print(f"  file: {len(data)} B  crc32={file_crc:08x}")
         print(f"  chip: {len(cur)} B  crc32={chip_crc:08x}  ({time.time()-t0:.1f} s)")
         if cur == data:
-            print(f"OK: {args.region} matches {args.input}")
+            scope = (f"first {len(data)} B of {args.region}"
+                     if read_end != end else args.region)
+            print(f"OK: {scope} matches {args.input}")
             return 0
         diff = _diff_blocks(args.region, entry, data, cur)
         blk_addrs = entry["block_size"]
-        total = (end - start + 1) // blk_addrs
+        total = want_addrs // blk_addrs
         print(f"MISMATCH: {len(diff)}/{total} block(s) differ", file=sys.stderr)
         show_n = 10
         for i in diff[:show_n]:
@@ -764,7 +782,7 @@ def cmd_diffprogram(args: argparse.Namespace) -> int:
         if args.region not in entry:
             print(f"device '{name}' has no {args.region} region", file=sys.stderr)
             return 2
-        data = _validate_file(args.region, entry, data)
+        data = _validate_file(args.region, entry, data, allow_short=args.short)
         if data is None:
             return 2
         if args.fast:
@@ -832,13 +850,17 @@ def cmd_watchprogram(args: argparse.Namespace) -> int:
             try:
                 with open(args.input, "rb") as fp:
                     data = fp.read()
-                data = _validate_file(args.region, entry, data)
+                data = _validate_file(args.region, entry, data,
+                                      allow_short=args.short)
                 if data is None:
                     continue
-                todo = [i for i in range(n_total)
+                n_covered = len(data) // blk_bytes
+                todo = [i for i in range(n_covered)
                         if data[i*blk_bytes:(i+1)*blk_bytes]
                         != bytes(model[i*blk_bytes:(i+1)*blk_bytes])]
-                print(f"  {len(todo)}/{n_total} blocks differ from model")
+                print(f"  {len(todo)}/{n_covered} blocks differ from model"
+                      + (f" (file covers {n_covered}/{n_total})"
+                         if n_covered != n_total else ""))
                 if not todo:
                     continue
                 p = _open_device(args)
@@ -887,24 +909,19 @@ def cmd_program(args: argparse.Namespace) -> int:
         if args.region not in entry:
             print(f"device '{name}' has no {args.region} region", file=sys.stderr)
             return 2
+        data = _validate_file(args.region, entry, data, allow_short=args.short)
+        if data is None:
+            return 2
         start, end = entry[args.region]
         # dflash holds 2 bytes per address; pflash 1
         bytes_per_addr = 2 if args.region == "dflash" else 1
-        expected = (end - start + 1) * bytes_per_addr
-        if len(data) < expected:
-            print(f"file is {len(data)} B but {args.region} needs {expected} B",
-                  file=sys.stderr)
-            return 2
-        if len(data) > expected:
-            print(f"note: file is {len(data)} B, truncating to {expected} B "
-                  f"({args.region} region size)", file=sys.stderr)
-            data = data[:expected]
+        write_end = start + len(data) // bytes_per_addr - 1
 
         if args.fast:
             actual = p.go_fast(target_baud=args.baud, osc_params=(osc_bytes_from_mhz(args.osc) if args.osc else None))
             sys.stderr.write(f"switched chip to {actual} baud\n")
 
-        print(f"programming {args.region} 0x{start:08X}..0x{end:08X} from "
+        print(f"programming {args.region} 0x{start:08X}..0x{write_end:08X} from "
               f"{args.input} ({len(data)} B in {args.chunk}-B chunks)")
         last = [0.0]
         def show(done: int, total: int) -> None:
@@ -915,7 +932,7 @@ def cmd_program(args: argparse.Namespace) -> int:
                 sys.stderr.flush()
                 last[0] = now
         t0 = time.time()
-        p.programming(start, end, data, bytes_per_addr=bytes_per_addr,
+        p.programming(start, write_end, data, bytes_per_addr=bytes_per_addr,
                       chunk_size=args.chunk, progress=show)
         sys.stderr.write("\n")
         print(f"  done in {time.time() - t0:.1f} s")
@@ -1202,14 +1219,22 @@ def main(argv: list[str] | None = None) -> int:
     _add_speed_opts(p_erase)
     p_erase.set_defaults(func=cmd_erase)
 
+    def _add_short_opt(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--short", action="store_true",
+                        help="allow a file smaller than the region: only the "
+                             "blocks the file covers are touched; the rest is "
+                             "left as-is (file is 0xFF-padded to the next block)")
+
     p_prog = sub.add_parser("program", help="write a file into pflash or dflash (destructive)")
     _add_port_opts(p_prog)
     p_prog.add_argument("region", choices=["pflash", "dflash"])
     p_prog.add_argument("input",
                         help="file with bytes to write (must match region size: "
-                             "pflash = address span, dflash = 2 × address span)")
+                             "pflash = address span, dflash = 2 × address span; "
+                             "use --short for partial files)")
     p_prog.add_argument("--chunk", type=lambda s: int(s, 0), default=256,
                         help="data-frame chunk size (default 256, max per spec)")
+    _add_short_opt(p_prog)
     _add_speed_opts(p_prog)
     p_prog.set_defaults(func=cmd_program)
 
@@ -1218,6 +1243,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_port_opts(p_ver)
     p_ver.add_argument("region", choices=["pflash", "dflash"])
     p_ver.add_argument("input", help="file to compare against (same size as `program`)")
+    _add_short_opt(p_ver)
     _add_speed_opts(p_ver)
     p_ver.set_defaults(func=cmd_verify)
 
@@ -1227,6 +1253,7 @@ def main(argv: list[str] | None = None) -> int:
     p_diff.add_argument("region", choices=["pflash", "dflash"])
     p_diff.add_argument("input",
                         help="file with the desired bytes (same size as `program`)")
+    _add_short_opt(p_diff)
     _add_speed_opts(p_diff)
     p_diff.set_defaults(func=cmd_diffprogram)
 
@@ -1238,6 +1265,7 @@ def main(argv: list[str] | None = None) -> int:
     p_watch.add_argument("input")
     p_watch.add_argument("--poll", type=float, default=1.0,
                          help="how often to check the file (seconds, default 1.0)")
+    _add_short_opt(p_watch)
     _add_speed_opts(p_watch)
     p_watch.set_defaults(func=cmd_watchprogram)
 
